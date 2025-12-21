@@ -10,12 +10,13 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 //
-// Authors explaination: Provide a copy of the first two lines in each redistributed version.
+// Authors explanation: Provide a copy of the first two lines in each redistributed version.
 
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use zstd::stream::read::Decoder;
 
 const KERNEL_FILES: &[&str] = &[
     "flash_api.cu",
@@ -88,7 +89,7 @@ fn main() -> Result<()> {
         |_| num_cpus::get_physical().min(20),
         |s| usize::from_str(&s).unwrap_or_else(|_| num_cpus::get_physical().min(20)),
     );
-    // limit to 20 cpus to not use to much ram on large servers
+    // limit to 20 cpus to not use too much ram on large servers
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus)
@@ -107,7 +108,17 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=kernels/**.hpp");
     println!("cargo:rerun-if-changed=kernels/**.cpp");
 
+    // If the vendored archive changes, rebuild.
+    println!("cargo:rerun-if-changed=vendor/cutlass.tar.zst");
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR not set")?);
+
+    // Ensure CUTLASS exists either as a checked-out submodule at ./cutlass
+    // or by extracting vendor/cutlass.tar.zst into ./cutlass (or OUT_DIR fallback).
+    let cutlass_root = ensure_cutlass_dir(&manifest_dir, &out_dir)?;
+
     // You can optionally allow an environment variable to cache the compiled artifacts.
     // If not found, we compile into the standard OUT_DIR.
     let build_dir = match std::env::var("CANDLE_FLASH_ATTN_BUILD_DIR") {
@@ -188,7 +199,7 @@ fn main() -> Result<()> {
                 command.args(["--default-stream", "per-thread"]);
 
                 // Include path
-                command.arg("-Icutlass/include");
+                command.arg(format!("-I{}", cutlass_root.join("include").display()));
 
                 // Undefine CUDA “no half/bfloat” macros
                 command.arg("-U__CUDA_NO_HALF_OPERATORS__");
@@ -342,4 +353,55 @@ fn compute_cap() -> Result<usize> {
             Err(anyhow!("nvidia-smi did not return a compute_cap line"))
         }
     }
+}
+
+fn ensure_cutlass_dir(manifest_dir: &Path, out_dir: &Path) -> Result<PathBuf> {
+    // Where you want it:
+    let cutlass_root = manifest_dir.join("cutlass");
+    let cutlass_include = cutlass_root.join("include").join("cutlass");
+    if cutlass_include.is_dir() {
+        return Ok(cutlass_root);
+    }
+
+    let archive = manifest_dir.join("vendor").join("cutlass.tar.zst");
+    if !archive.is_file() {
+        return Err(anyhow!(
+            "CUTLASS not found at {} and archive missing at {}",
+            cutlass_root.display(),
+            archive.display()
+        ));
+    }
+
+    // Rebuild if the archive changes.
+    println!("cargo:rerun-if-changed={}", archive.display());
+
+    // Unpack into ./cutlass; if that fails (read-only), fall back to OUT_DIR/cutlass.
+    if let Err(e) = unpack_zst_tar(&archive, &cutlass_root) {
+        let fallback_root = out_dir.join("cutlass");
+        unpack_zst_tar(&archive, &fallback_root).map_err(|e2| {
+            anyhow!(
+                "Failed unpacking CUTLASS. ./cutlass error: {e}. OUT_DIR error: {e2}"
+            )
+        })?;
+        return Ok(fallback_root);
+    }
+
+    Ok(cutlass_root)
+}
+
+fn unpack_zst_tar(archive: &Path, dest: &Path) -> Result<()> {
+    // Clean destination to avoid mixing old/new
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).with_context(|| format!("remove {}", dest.display()))?;
+    }
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+
+    let f =
+        std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    let decoder = Decoder::new(f).context("create zstd decoder")?;
+    let mut ar = tar::Archive::new(decoder);
+    ar.unpack(dest)
+        .with_context(|| format!("unpack into {}", dest.display()))?;
+
+    Ok(())
 }

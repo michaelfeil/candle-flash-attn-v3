@@ -30,6 +30,9 @@ half = { version = "2.3.1", features = ["num-traits"] }
 anyhow = { version = "1", features = ["backtrace"] }
 num_cpus = "1.15.0"
 rayon = "1.7.0"
+tar = "0.4"
+zstd = "0.13"
+
 
 [dev-dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
