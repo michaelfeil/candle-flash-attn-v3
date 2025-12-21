@@ -1,5 +1,5 @@
 [package]
-name = "candle-flash-attn-v3"
+name = "candle-flash-attn-3"
 version = "0.0.1-rc0"
 edition = "2021"
 
