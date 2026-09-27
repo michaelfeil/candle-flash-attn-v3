@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2024 Michael Feil
+//               2025 adjusted by Eric Buehler for candle repo.
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 // http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
@@ -16,7 +17,7 @@ use candle::{CpuStorage, DType, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
 
 #[cfg(feature = "cuda-12")]
-use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 
 #[cfg(feature = "cuda-11")]
 use candle::cuda_backend::{cudarc::driver::DevicePtr, WrapErr};
@@ -174,16 +175,20 @@ impl FlashAttn {
         let elem_count = out_shape.elem_count();
 
         #[cfg(feature = "cuda-12")]
-        let dst = unsafe { dev.alloc::<T>(elem_count) }?;
+        let mut dst = unsafe { dev.alloc::<T>(elem_count) }?;
         #[cfg(feature = "cuda-11")]
         let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
 
         #[cfg(feature = "cuda-12")]
-        let softmax_lse = dev.alloc_zeros::<f32>(b_sz * 128 * num_heads * seqlen_q)?;
+        let mut softmax_lse = dev.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q)?;
         #[cfg(feature = "cuda-11")]
-        let softmax_lse = dev
-            .alloc_zeros::<f32>(b_sz * 128 * num_heads * seqlen_q)
-            .w()?;
+        let softmax_lse = dev.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q).w()?;
+
+        // The persistent scheduler needs a fresh counter for every launch.
+        #[cfg(feature = "cuda-12")]
+        let mut tile_count_semaphore = dev.alloc_zeros::<i32>(1)?;
+        #[cfg(feature = "cuda-11")]
+        let tile_count_semaphore = dev.alloc_zeros::<i32>(1).w()?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
@@ -215,11 +220,13 @@ impl FlashAttn {
             let (v_devptr, _v_sync) = v.device_ptr(stream_ref);
             let v_ptr = v_devptr as usize as *const core::ffi::c_void;
 
-            let (dst_devptr, _dst_sync) = dst.device_ptr(stream_ref);
+            let (dst_devptr, _dst_sync) = dst.device_ptr_mut(stream_ref);
             let dst_ptr = dst_devptr as usize as *const core::ffi::c_void;
 
-            let (softmax_lse_devptr, _lse_sync) = softmax_lse.device_ptr(stream_ref);
+            let (softmax_lse_devptr, _lse_sync) = softmax_lse.device_ptr_mut(stream_ref);
             let softmax_lse_ptr = softmax_lse_devptr as usize as *const core::ffi::c_void;
+            let (tile_count_semaphore_ptr, _counter_sync) =
+                tile_count_semaphore.device_ptr_mut(stream_ref);
 
             unsafe {
                 ffi::run_mha(
@@ -229,6 +236,7 @@ impl FlashAttn {
                     dst_ptr,
                     softmax_lse_ptr,
                     /* alibi_slopes_ptr */ alibi_slopes_ptr,
+                    /* tile_count_semaphore_ptr */ tile_count_semaphore_ptr as *const i32,
                     /* cu_seqlens_q_ptr */ std::ptr::null(),
                     /* cu_seqlens_k_ptr */ std::ptr::null(),
                     /* q_batch_stride */ q_stride[0] as u32,
@@ -262,6 +270,7 @@ impl FlashAttn {
                     /* window_size_right */ window_size_right,
                     /* total_q, dummy */ 0u32,
                     /* total_k, dummy */ 0u32,
+                    /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
                 )
             }
         }
@@ -273,6 +282,7 @@ impl FlashAttn {
             let v_ptr = *v.device_ptr() as *const core::ffi::c_void;
             let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
             let softmax_lse_ptr = *softmax_lse.device_ptr() as *const core::ffi::c_void;
+            let tile_count_semaphore_ptr = *tile_count_semaphore.device_ptr();
             ffi::run_mha(
                 q_ptr,
                 k_ptr,
@@ -280,6 +290,7 @@ impl FlashAttn {
                 dst_ptr,
                 softmax_lse_ptr,
                 /* alibi_slopes_ptr */ alibi_slopes_ptr,
+                /* tile_count_semaphore_ptr */ tile_count_semaphore_ptr as *const i32,
                 /* cu_seqlens_q_ptr */ std::ptr::null(),
                 /* cu_seqlens_k_ptr */ std::ptr::null(),
                 /* q_batch_stride */ q_stride[0] as u32,
@@ -313,6 +324,7 @@ impl FlashAttn {
                 /* window_size_right */ window_size_right,
                 /* total_q, dummy */ 0u32,
                 /* total_k, dummy */ 0u32,
+                /* stream_ptr */ *dev.cu_stream() as *mut core::ffi::c_void,
             )
         }
 
@@ -676,9 +688,6 @@ impl FlashAttnVarLen {
             .filter(|v| v <= &self.max_seqlen_k)
             .map(|v| v as i32)
             .unwrap_or(-1);
-        if window_size_left < self.max_seqlen_k as i32 {
-            window_size_left = self.max_seqlen_k.clone() as i32;
-        }
 
         // if window_size_right > self.max_seqlen_k or None => -1
         let mut window_size_right = self
@@ -686,9 +695,6 @@ impl FlashAttnVarLen {
             .filter(|v| v <= &self.max_seqlen_k)
             .map(|v| v as i32)
             .unwrap_or(-1);
-        if window_size_right < self.max_seqlen_k as i32 {
-            window_size_right = self.max_seqlen_k.clone() as i32;
-        }
 
         let head_size = round_multiple(head_size_og, 8);
         let head_size_rounded = round_multiple(head_size, 32);
@@ -698,14 +704,20 @@ impl FlashAttnVarLen {
         let elem_count = out_shape.elem_count();
 
         #[cfg(feature = "cuda-12")]
-        let dst = unsafe { dev.alloc::<T>(elem_count) }?;
+        let mut dst = unsafe { dev.alloc::<T>(elem_count) }?;
         #[cfg(feature = "cuda-11")]
         let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
 
         #[cfg(feature = "cuda-12")]
-        let softmax_lse = dev.alloc_zeros::<f32>(num_heads * total_q)?;
+        let mut softmax_lse = dev.alloc_zeros::<f32>(num_heads * total_q)?;
         #[cfg(feature = "cuda-11")]
         let softmax_lse = dev.alloc_zeros::<f32>(num_heads * total_q).w()?;
+
+        // The persistent scheduler needs a fresh counter for every launch.
+        #[cfg(feature = "cuda-12")]
+        let mut tile_count_semaphore = dev.alloc_zeros::<i32>(1)?;
+        #[cfg(feature = "cuda-11")]
+        let tile_count_semaphore = dev.alloc_zeros::<i32>(1).w()?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
@@ -737,11 +749,13 @@ impl FlashAttnVarLen {
             let (v_devptr, _v_sync) = v.device_ptr(stream_ref);
             let v_ptr = v_devptr as usize as *const core::ffi::c_void;
 
-            let (dst_devptr, _dst_sync) = dst.device_ptr(stream_ref);
+            let (dst_devptr, _dst_sync) = dst.device_ptr_mut(stream_ref);
             let dst_ptr = dst_devptr as usize as *const core::ffi::c_void;
 
-            let (softmax_lse_devptr, _lse_sync) = softmax_lse.device_ptr(stream_ref);
+            let (softmax_lse_devptr, _lse_sync) = softmax_lse.device_ptr_mut(stream_ref);
             let softmax_lse_ptr = softmax_lse_devptr as usize as *const core::ffi::c_void;
+            let (tile_count_semaphore_ptr, _counter_sync) =
+                tile_count_semaphore.device_ptr_mut(stream_ref);
 
             let (seqlens_q_devptr, _seqlens_q_sync) = seqlens_q.device_ptr(stream_ref);
             let seqlens_q_ptr = seqlens_q_devptr as usize as *const core::ffi::c_int;
@@ -757,6 +771,7 @@ impl FlashAttnVarLen {
                     dst_ptr,
                     softmax_lse_ptr,
                     /* alibi_slopes_ptr */ alibi_slopes_ptr,
+                    /* tile_count_semaphore_ptr */ tile_count_semaphore_ptr as *const i32,
                     /* cu_seqlens_q_ptr */ seqlens_q_ptr,
                     /* cu_seqlens_k_ptr */ seqlens_k_ptr,
                     /* q_batch_stride */ 0,
@@ -790,6 +805,7 @@ impl FlashAttnVarLen {
                     /* window_size_right */ window_size_right,
                     /* total_q */ total_q as u32,
                     /* total_k */ total_k as u32,
+                    /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
                 )
             }
         }
@@ -801,6 +817,7 @@ impl FlashAttnVarLen {
             let v_ptr = *v.device_ptr() as *const core::ffi::c_void;
             let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
             let softmax_lse_ptr = *softmax_lse.device_ptr() as *const core::ffi::c_void;
+            let tile_count_semaphore_ptr = *tile_count_semaphore.device_ptr();
             let seqlens_q_ptr = *seqlens_q.device_ptr() as *const core::ffi::c_int;
             let seqlens_k_ptr = *seqlens_k.device_ptr() as *const core::ffi::c_int;
             ffi::run_mha(
@@ -810,6 +827,7 @@ impl FlashAttnVarLen {
                 dst_ptr,
                 softmax_lse_ptr,
                 /* alibi_slopes_ptr */ alibi_slopes_ptr,
+                /* tile_count_semaphore_ptr */ tile_count_semaphore_ptr as *const i32,
                 /* cu_seqlens_q_ptr */ seqlens_q_ptr,
                 /* cu_seqlens_k_ptr */ seqlens_k_ptr,
                 /* q_batch_stride */ 0,
@@ -843,6 +861,7 @@ impl FlashAttnVarLen {
                 /* window_size_right */ window_size_right,
                 /* total_q */ total_q as u32,
                 /* total_k */ total_k as u32,
+                /* stream_ptr */ *dev.cu_stream() as *mut core::ffi::c_void,
             )
         }
 

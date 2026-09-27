@@ -206,6 +206,7 @@ extern "C" void run_mha(
     void *o_ptr,
     void *softmax_lse_ptr,
     void *alibi_slopes_ptr,
+    int32_t *tile_count_semaphore_ptr,
 
     int32_t *cu_seqlens_q_ptr,
     int32_t *cu_seqlens_k_ptr,
@@ -247,7 +248,8 @@ extern "C" void run_mha(
     int window_size_right,
 
     uint32_t total_q,
-    uint32_t total_k
+    uint32_t total_k,
+    void *stream_ptr
 ) {
     Flash_fwd_params params;
     // Reset the parameters
@@ -261,6 +263,7 @@ extern "C" void run_mha(
 
     params.softmax_lse_ptr = softmax_lse_ptr;
     params.alibi_slopes_ptr = alibi_slopes_ptr;
+    params.tile_count_semaphore = tile_count_semaphore_ptr;
 
     // All stride are in elements, not bytes.
     params.q_batch_stride = q_batch_stride;
@@ -312,6 +315,12 @@ extern "C" void run_mha(
     params.is_causal = is_causal;
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+    // The kernel launchers select the local-mask specialization from is_local,
+    // not from the window sizes. A finite window was previously passed through
+    // with is_local left false by memset, silently running global attention.
+    params.is_local = !params.is_causal &&
+        ((window_size_left >= 0 && window_size_left < int(seqlen_k)) ||
+         (window_size_right >= 0 && window_size_right < int(seqlen_k)));
 
     params.num_splits = 0;
     params.page_block_size = -1;
@@ -320,10 +329,11 @@ extern "C" void run_mha(
     params.total_k = total_k;
 
     params.unpadded_lse = unpadded_lse;
-    params.use_gqa_packing = use_gqa_packing;
+    // Packed launchers use fixed sequence traits and cannot handle ragged inputs.
+    params.use_gqa_packing = cu_seqlens_q_ptr != nullptr ? 0 : use_gqa_packing;
 
     // print_params(params);
     
-    cudaStream_t stream = 0; // Use the default stream.
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     run_mha_fwd(params, stream);
 }
